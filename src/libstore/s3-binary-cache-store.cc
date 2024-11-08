@@ -151,6 +151,31 @@ ref<Aws::Client::ClientConfiguration> S3Helper::makeConfig(
     return res;
 }
 
+class InterruptibleStringStream : public std::stringstream
+{
+private:
+    size_t bytesRead = 0;
+    static constexpr size_t checkInterval = 1024 * 1024; // Check for interrupts every 1MB
+
+public:
+    InterruptibleStringStream() : std::stringstream() {}
+
+    // Override read to check for interrupts periodically
+    std::basic_istream<char>& read(char* s, std::streamsize n) override
+    {
+        std::basic_istream<char>& result = std::stringstream::read(s, n);
+        bytesRead += n;
+        
+        if (bytesRead >= checkInterval) {
+            checkInterrupt();
+            bytesRead = 0;
+        }
+        
+        return result;
+    }
+};
+
+// Modified S3Helper::getObject implementation
 S3Helper::FileTransferResult S3Helper::getObject(
     const std::string & bucketName, const std::string & key)
 {
@@ -162,20 +187,21 @@ S3Helper::FileTransferResult S3Helper::getObject(
         .WithKey(key);
 
     request.SetResponseStreamFactory([&]() {
-        return Aws::New<std::stringstream>("STRINGSTREAM");
+        return Aws::New<InterruptibleStringStream>("INTERRUPTIBLE_STREAM");
     });
 
     FileTransferResult res;
-
     auto now1 = std::chrono::steady_clock::now();
 
     try {
-
         auto result = checkAws(fmt("AWS error fetching '%s'", key),
             client->GetObject(request));
 
+        // Add an extra interrupt check before decompression
+        checkInterrupt();
+        
         res.data = decompress(result.GetContentEncoding(),
-            dynamic_cast<std::stringstream &>(result.GetBody()).str());
+            dynamic_cast<InterruptibleStringStream &>(result.GetBody()).str());
 
     } catch (S3Error & e) {
         if ((e.err != Aws::S3::S3Errors::NO_SUCH_KEY) &&
@@ -183,7 +209,6 @@ S3Helper::FileTransferResult S3Helper::getObject(
     }
 
     auto now2 = std::chrono::steady_clock::now();
-
     res.durationMs = std::chrono::duration_cast<std::chrono::milliseconds>(now2 - now1).count();
 
     return res;
